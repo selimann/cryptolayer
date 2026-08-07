@@ -39,3 +39,6 @@ class UIProvider(ABC):
     @abstractmethod
     def on_disconnect(self):
         pass
+
+    def on_file_received(self, timestamp: int, file_path: str, original_name: str):
+        pass

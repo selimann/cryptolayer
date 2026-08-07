@@ -48,7 +48,7 @@ class CryptoLayer:
         self.NODE_ID_FILE_PATH = os.path.join(data_dir, config.NODE_ID_FILE_NAME)
         self.SIGN_PRIVATE_FILE_PATH = os.path.join(data_dir, config.SIGN_PRIVATE_FILE_NAME)
         self.LOGS_FILE_PATH = os.path.join(data_dir, config.LOGS_FILE_NAME)
-
+        self.RECEIVED_FILES_DIR_PATH = os.path.join(data_dir, "received_files")
         # Логирование
         self.LOGGER = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
 
@@ -89,11 +89,112 @@ class CryptoLayer:
         self.TRANSITIONAL_LEVEL_INGESTER = None
 
 
+
+    # Отправка файла
+    def send_file(self, file_path: str):
+
+        if not getattr(self.MODULE_CLASS, "supports_files", False):
+            raise NotImplementedError("Текущий модуль не поддерживает передачу файлов")
+
+        original_name = os.path.basename(file_path)
+
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+
+        name_bytes = original_name.encode("utf-8")
+        container = len(name_bytes).to_bytes(4, "big") + name_bytes + file_bytes
+
+        nonce = os.urandom(12)
+        aesgcm = AESGCM(self.AES_KEY)
+        ciphertext = aesgcm.encrypt(nonce, container, associated_data=None)
+
+        signature = self.SIGN_PRIVATE_KEY.sign(nonce + ciphertext, ec.ECDSA(hashes.SHA256()))
+
+        payload = len(signature).to_bytes(2, "big") + signature + nonce + ciphertext
+
+        tmp_path = os.path.join(self.data_dir, f"out_{uuid.uuid4().hex}.clenc")
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(payload)
+            self.MODULE_CLASS.sender.send_file(tmp_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+
+    # Приём файла, вызывается модулем напрямую как file_ingester
+    def receive_file_from_module(self, local_path: str):
+
+        try:
+            with open(local_path, "rb") as f:
+                payload = f.read()
+
+            sig_len = int.from_bytes(payload[:2], "big")
+            signature = payload[2:2 + sig_len]
+            nonce = payload[2 + sig_len:2 + sig_len + 12]
+            ciphertext = payload[2 + sig_len + 12:]
+
+            self.COMPANION_SIGN.verify(signature, nonce + ciphertext, ec.ECDSA(hashes.SHA256()))
+
+            aesgcm = AESGCM(self.AES_KEY)
+            container = aesgcm.decrypt(nonce, ciphertext, associated_data=None)
+
+            name_len = int.from_bytes(container[:4], "big")
+            original_name = os.path.basename(container[4:4 + name_len].decode("utf-8"))
+            file_data = container[4 + name_len:]
+
+            final_path = os.path.join(self.RECEIVED_FILES_DIR_PATH, f"{uuid.uuid4().hex}_{original_name}")
+            with open(final_path, "wb") as f:
+                f.write(file_data)
+
+            self.ui_provider.on_file_received(int(time.time()), final_path, original_name)
+
+        except Exception as e:
+            self.LOGGER.warning(f"File: failed to process received file: {e}")
+            self.ui_provider.update_status("File", "Invalid or tampered file rejected", "error")
+        finally:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+
+
+    # Общий механизм ожидания ответа собеседника для всех трёх шагов
+    # рукопожатия (node id, подпись, ECDH-публичный ключ) - раньше каждый
+    # шаг был отдельным `while not X: time.sleep(0.1)` без таймаута и без
+    # повтора отправки, из-за чего сессия могла зависнуть навсегда без
+    # единой ошибки, если первый пакет потерялся (гонка старта: оба
+    # клиента жмут "начать шифрованную сессию" почти одновременно, и один
+    # успевает отправить раньше, чем другой поднял свой приёмник) или
+    # собеседник вообще не запустил сессию со своей стороны.
+    #
+    # check_fn: вернуть True, когда ответ уже получен (например,
+    # lambda: self.COMPANION_NODE_ID).
+    # resend_fn: переотправить свою часть (например,
+    # lambda: self.APPLICATION_LEVEL.send_my_node_id(self.NODE_ID)).
+    # description: только для сообщений статуса/лога.
+    def wait_for_companion(self, check_fn, resend_fn, description):
+        start = time.time()
+        last_resend = start
+        while not check_fn():
+            now = time.time()
+            elapsed = now - start
+            if elapsed > config.HANDSHAKE_TIMEOUT_SECONDS:
+                message = f"Timed out waiting for companion's {description} after {config.HANDSHAKE_TIMEOUT_SECONDS}s - they may not be running zkgram, or have not started an encrypted session on their side yet"
+                self.ui_provider.update_status("Signatures", message, "error")
+                self.LOGGER.error(message)
+                raise TimeoutError(message)
+            if now - last_resend > config.HANDSHAKE_RESEND_INTERVAL_SECONDS:
+                self.LOGGER.info(f"No {description} from companion yet, re-sending ours")
+                resend_fn()
+                last_resend = now
+            time.sleep(0.1)
+
+
     def init(self):
 
         # Создаем директорию с данными
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.KNOWN_NODES_DIR_PATH, exist_ok=True)
+        os.makedirs(self.RECEIVED_FILES_DIR_PATH, exist_ok=True)
 
         # инциализация уровней
         self.init_levels()
@@ -139,8 +240,9 @@ class CryptoLayer:
         self.ui_provider.update_status("Module", "Create session...", "in_progress")
 
         # Создаем сессию в модуле мессенджера
-        self.MODULE_CLASS.create_session(self.TRANSITIONAL_LEVEL_INGESTER)
+        self.MODULE_CLASS.create_session(self.TRANSITIONAL_LEVEL_INGESTER, self.receive_file_from_module)
         self.TRANSITIONAL_LEVEL.update_levels(self.TRANSPORT_LEVEL, self.MODULE_CLASS.sender)
+
 
         self.ui_provider.update_status("Module", "Done", "success")
 
@@ -252,8 +354,11 @@ class CryptoLayer:
         self.APPLICATION_LEVEL.send_my_node_id(self.NODE_ID)
         self.ui_provider.update_status("Signatures", "Waiting for companion node id...", "in_progress")
         self.LOGGER.info("Signatures: Waiting for companion node id...")
-        while not self.COMPANION_NODE_ID:
-            time.sleep(0.1)
+        self.wait_for_companion(
+            lambda: self.COMPANION_NODE_ID,
+            lambda: self.APPLICATION_LEVEL.send_my_node_id(self.NODE_ID),
+            "node id",
+        )
         self.ui_provider.update_status("Signatures", "Companion node id received!", "in_progress")
         self.LOGGER.info("Signatures: Companion node id received!")
 
@@ -271,8 +376,11 @@ class CryptoLayer:
             self.APPLICATION_LEVEL.send_my_sign(my_sign_public_bytes_X962)
             self.ui_provider.update_status("Signatures", "Waiting for companion signature...", "in_progress")
             self.LOGGER.info("Signatures: Waiting for companion signature...")
-            while not self.COMPANION_SIGN:
-                time.sleep(0.1)
+            self.wait_for_companion(
+                lambda: self.COMPANION_SIGN,
+                lambda: self.APPLICATION_LEVEL.send_my_sign(my_sign_public_bytes_X962),
+                "signature",
+            )
             self.ui_provider.update_status("Signatures", "Companion signature received!", "in_progress")
             self.LOGGER.info("Signatures: Companion signature received!")
 
@@ -355,8 +463,11 @@ class CryptoLayer:
 
         self.ui_provider.update_status("Encryption", "Waiting for companion public key...", "in_progress")
         self.LOGGER.info("Encryption: Waiting for companion public key...")
-        while not self.COMPANION_PUBLIC_KEY:
-            time.sleep(0.1)
+        self.wait_for_companion(
+            lambda: self.COMPANION_PUBLIC_KEY,
+            lambda: self.APPLICATION_LEVEL.send_my_public_key(my_pkey_bytes),
+            "public key",
+        )
 
         self.ui_provider.update_status("Encryption", "Companion public key received!", "in_progress")
         self.LOGGER.info("Encryption: Companion public key received!")
@@ -508,4 +619,6 @@ class CryptoLayer:
     # Таймаут при пинге
     def on_ping_timeout(self):
         self.ui_provider.on_ping_timeout()
+
+    
 
